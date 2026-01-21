@@ -1,0 +1,17 @@
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+scipy
+statsmodels
+ydata-profiling
+pandas-datareader
+setuptools
+ipywidgets
+nbformat>=4.2.0
+kaleido
+plotly
+xgboost
+# tensorflow  # Uncomment if needed - requires specific installation
+# torch  # Install separately from pytorch.org for your system

@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MySQL Replication Internals - Sunil Patel</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="header">
+        <nav class="nav">
+            <div class="nav-container">
+                <div class="nav-brand">
+                    <a href="#" class="brand-link">Sunil Patel</a>
+                </div>
+                <div class="nav-links">
+                    <a href="blogs.html" class="nav-link">Blogs</a>
+                    <a href="papershelf.html" class="nav-link">Papershelf</a>
+                    <a href="bookshelf.html" class="nav-link">Bookshelf</a>
+                    <a href="courses.html" class="nav-link">Courses</a>
+                    <a href="#" class="nav-link">Talks</a>
+                </div>
+            </div>
+        </nav>
+    </header>
+
+    <main class="main">
+        <article class="article">
+            <header class="article-header">
+                <div class="author-info">
+                    <h1 class="author-name">Sunil Patel</h1>
+                    <p class="author-description">engineering, databases, and systems. always building.</p>
+                </div>
+            </header>
+
+            <div class="article-content">
+                <h1 class="article-title">MySQL Replication Internals</h1>
+
+                <p class="article-intro">
+                    MySQL replication enables data synchronization across databases, powering read scaling and even some complex distributed architectures. At the core lies the binary log (binlog), which is the authoritative record of all data modifications on a source server.
+                </p>
+
+                <p class="article-intro">
+                    Getting a hang of how binlog replication works is not only fun, but it also builds an intuition as to how other databases would be doing it. More importantly, if you face any replication related issues in production, you know what could have gone wrong.
+                </p>
+
+                <p class="article-intro">
+                    This essay covers MySQL binlog replication internals along with looking at how events are structured, how threads handle replication, the different modes, and tips for keeping it running smoothly at scale. So, here we go…
+                </p>
+
+                <h2>Why Binlog Replication Matters</h2>
+
+                <p>
+                    MySQL's binary log keeps a record of every change to the database, essentially serving as the source of truth for what happened and when. Because of this, it supports several key features:
+                </p>
+
+                <p>
+                    First, it allows read scaling by replicating data to replica servers that can handle read queries. Second, it provides high availability by maintaining standby servers ready to take over if the primary fails. Third, it enables point-in-time recovery by replaying binary logs to restore a database to any moment in time. Fourth, it supports change data capture (CDC) by allowing external systems to consume database changes in real time.
+                </p>
+
+                <h2>Binary Log</h2>
+
+                <p>
+                    The binary log is a sequence of files that record changes to the database. Each file has a base name (configurable via the <code>log_bin</code> option) followed by a numeric suffix that increments with each new file. An index file tracks all current binary log files.
+                </p>
+
+                <pre><code>mysql-bin.000001
+mysql-bin.000002
+mysql-bin.000003
+mysql-bin.index</code></pre>
+
+                <p>
+                    Binary log files roll over either when they reach a certain size (controlled by <code>max_binlog_size</code>, usually 1GB) or whenever the server restarts. The index file is just a plain text list pointing to all the current log files.
+                </p>
+
+                <p>
+                    Each binary log file begins with a magic number (0xfe626963, which spells "binlog" in ASCII) followed by a format description event that defines how subsequent events should be interpreted. This format description contains versioning information that allows different MySQL versions to understand each other's binary logs during replication.
+                </p>
+
+                <h2>Binary Log Event Structure</h2>
+
+                <p>
+                    Every change recorded in the binary log is stored as an event. Events have a 19-byte header followed by event-specific data. Something like this…
+                </p>
+
+                <ul>
+                    <li><strong>Timestamp (4B):</strong> when the event occurred</li>
+                    <li><strong>Type code (1B):</strong> the event type</li>
+                    <li><strong>Server ID (4B):</strong> id of the server that generated the event</li>
+                    <li><strong>Event length (4B):</strong> size of the event, including the header</li>
+                    <li><strong>Next position (4B):</strong> Position of the next event in the binlog</li>
+                    <li><strong>Flags (2B):</strong> Various flags controlling event behavior</li>
+                </ul>
+
+                <pre><code>+=====================================+
+| event  | timestamp         0 : 4   |
+| header +----------------------------+
+|        | type_code         4 : 1   |
+|        +----------------------------+
+|        | server_id         5 : 4   |
+|        +----------------------------+
+|        | event_length      9 : 4   |
+|        +----------------------------+
+|        | next_position    13 : 4   |
+|        +----------------------------+
+|        | flags            17 : 2   |
++=====================================+
+| event  | fixed part       19 : y   |
+| data   +----------------------------+
+|        | variable part             |
++=====================================+</code></pre>
+
+                <h2>Common Event Types</h2>
+
+                <p>MySQL uses several event types, but some important ones are …</p>
+
+                <ol>
+                    <li><code>FORMAT_DESCRIPTION_EVENT</code> is the first event in every binary log file. It describes the server version and provides metadata needed to interpret all subsequent events.</li>
+                    <li><code>QUERY_EVENT</code> contains SQL statements that were executed on the source. The event includes the database context, the SQL statement text, and various execution metadata.</li>
+                    <li><code>WRITE_ROWS_EVENT</code>, <code>UPDATE_ROWS_EVENT</code>, and <code>DELETE_ROWS_EVENT</code> contain the actual row data for inserts, updates, and deletes in row-based replication. Update events include both before and after images of modified rows.</li>
+                    <li><code>GTID_LOG_EVENT</code> contains the global transaction identifier for GTID-based replication. This event appears at the start of each transaction and contains the unique identifier along with logical timestamps used for parallel replication.</li>
+                    <li><code>XID_EVENT</code> marks the end of a transaction that was committed. The <code>XID</code> (transaction ID) links the binary log entry to the storage engine's internal transaction tracking.</li>
+                    <li><code>ROTATE_EVENT</code> indicates that the server is switching to a new binary log file. This event is appended as the last event before rotating to a new file.</li>
+                </ol>
+
+                <h2>Binary Log Formats</h2>
+
+                <p>
+                    MySQL supports three binary logging formats, each with different tradeoffs for space efficiency, safety, and compatibility.
+                </p>
+
+                <h3>Statement-based Logging</h3>
+
+                <p>
+                    Statement-based logging (SBR) records the actual SQL statements that were executed. This format is compact because a single statement like <code>UPDATE users SET status = 'active' WHERE created_at < '2024-01-01'</code> is stored as one event regardless of how many rows it affects.
+                </p>
+
+                <pre><code>-- This single statement might update millions of rows
+-- but is stored as one compact event in SBR
+UPDATE users SET status = 'active' WHERE created_at < '2024-01-01';</code></pre>
+
+                <p>
+                    However, SBR has limitations. Non-deterministic functions like <code>NOW()</code>, <code>UUID()</code>, or <code>RAND()</code> can produce different results when replayed on a replica. Statements using <code>LIMIT</code> without <code>ORDER BY</code> are also problematic because row ordering may differ between servers.
+                </p>
+
+                <h3>Row-based Logging</h3>
+
+                <p>
+                    Row-based logging (RBR) records the actual row changes rather than the statements that produced them. Each modified row is stored with its before and after images for updates, or just the relevant image for inserts and deletes.
+                </p>
+
+                <pre><code>### INSERT INTO test.users
+### SET
+###   @1=1
+###   @2='john_doe'
+###   @3='2024-01-15'
+
+### UPDATE test.users
+### WHERE
+###   @1=1
+###   @2='john_doe'
+###   @3='2024-01-15'
+### SET
+###   @1=1
+###   @2='john_doe_updated'
+###   @3='2024-01-15'</code></pre>
+
+                <p>
+                    RBR guarantees that replicas receive exactly the same row changes that occurred on the source. The tradeoff is larger binary logs when statements affect many rows. A single <code>UPDATE</code> touching a million rows generates a million row events.
+                </p>
+
+                <h3>Mixed Logging</h3>
+
+                <p>
+                    Mixed logging (MBR) combines both approaches. MySQL uses statement-based logging by default but automatically switches to row-based logging for statements that would be unsafe to replicate as statements. This balances compactness and safety.
+                </p>
+
+                <p>
+                    By the way, row-based logging is the default in MySQL 8.0 and is recommended for most production workloads due to its reliability and deterministic behavior.
+                </p>
+
+                <h2>Replication Architecture</h2>
+
+                <p>
+                    MySQL replication uses an asynchronous, pull-based architecture. The replica initiates connections to the source and requests binary log events, which are then applied locally. This makes replicas to operate independently and recover gracefully from network interruptions.
+                </p>
+
+                <p>On the source server:</p>
+                <ul>
+                    <li>Binary log: Stores all changes as events</li>
+                    <li>Binlog dump thread: Sends binary log events to connected replicas</li>
+                </ul>
+
+                <p>On the replica server:</p>
+                <ul>
+                    <li>I/O thread (receiver thread): Connects to the source and receives events</li>
+                    <li>Relay log: Local storage for received events</li>
+                    <li>SQL thread (applier thread): Reads relay log and applies events</li>
+                    <li>Worker threads: Apply events in parallel when multi-threaded replication is enabled</li>
+                </ul>
+
+                <h2>Binlog Dump Thread</h2>
+
+                <p>
+                    When a replica connects to a source for replication, the source creates a dedicated binlog dump thread to serve that replica. This thread is responsible for reading events from the binary log and sending them over the network.
+                </p>
+
+                <p>
+                    The dump thread maintains the binary log position requested by the replica and sends events as they become available. When the source is idle with no new changes, the dump thread waits (not busy-wait) for new events to be written to the binary log.
+                </p>
+
+                <p>
+                    By the way, you can observe binlog dump threads on the source server using <code>SHOW PROCESSLIST</code>
+                </p>
+
+                <pre><code>mysql> SHOW PROCESSLIST\G
+*************************** 1. row ***************************
+     Id: 42
+   User: repl_user
+   Host: 192.168.1.100:54321
+     db: NULL
+Command: Binlog Dump
+   Time: 3600
+  State: Master has sent all binlog to slave; waiting for more updates
+   Info: NULL</code></pre>
+
+                <p>
+                    Each connected replica gets its own binlog dump thread. If you have five replicas, the source maintains five dump threads. This is generally lightweight because the threads spend most of their time waiting for new events.
+                </p>
+
+                <h2>The I/O thread (receiver thread)</h2>
+
+                <p>
+                    The replica's I/O thread is responsible for connecting to the source server and receiving binary log events. When you start replication with <code>START REPLICA</code>, the I/O thread sets up a connection to the source specified in the <code>CHANGE REPLICATION SOURCE TO</code> command.
+                </p>
+
+                <p>
+                    Once connected, the I/O thread requests binary log events starting from the position recorded in the replica's connection metadata. As events arrive, the thread writes them to the local relay log without processing them. This separation of receiving and applying events is an important design decision.
+                </p>
+
+                <p>
+                    First, it allows the replica to buffer events locally even when the applier is slow or stopped. Second, it enables the replica to catch up quickly after being offline because the I/O thread can pull events as fast as the network allows. Third, it provides a checkpoint mechanism where the relay log position can be used to resume replication after interruptions.
+                </p>
+
+                <h2>The Relay Log</h2>
+
+                <p>
+                    The relay log (which is on a replica) is structurally identical to the binary log. It consists of numbered files containing the same event format as binary logs. The key difference is that relay logs contain events received from a source server rather than events generated locally.
+                </p>
+
+                <pre><code>relay-bin.000001
+relay-bin.000002
+relay-bin.index</code></pre>
+
+                <p>
+                    Relay log files are created as the I/O thread receives events from the source. The SQL thread reads from relay logs to apply changes. Once events have been applied, relay log files are automatically deleted to free disk space.
+                </p>
+
+                <p>
+                    The relay log serves as a buffer between network reception and the local application. This buffering is crucial for handling situations where the applier falls behind the receiver. Without relay logs, a slow application would create backpressure all the way to the source server.
+                </p>
+
+                <h2>The SQL Thread (applier)</h2>
+
+                <p>
+                    The SQL thread reads events from the relay log and applies them to the local database. In single-threaded mode, this thread processes events sequentially in the exact order they appear in the relay log.
+                </p>
+
+                <p>For each event, the SQL thread performs appropriate actions:</p>
+                <ul>
+                    <li><code>QUERY_EVENT</code>: Executes the SQL statement</li>
+                    <li><code>WRITE_ROWS_EVENT</code>: Inserts the specified rows</li>
+                    <li><code>UPDATE_ROWS_EVENT</code>: Updates rows matching the before-image to the after-image</li>
+                    <li><code>DELETE_ROWS_EVENT</code>: Deletes rows matching the specified image</li>
+                </ul>
+
+                <p>
+                    After successfully applying an event, the SQL thread updates the applier metadata to record its progress. This metadata includes the relay log position and the corresponding source binary log position.
+                </p>
+
+                <p>
+                    The SQL thread is often the bottleneck in replication because it must apply changes sequentially in single-threaded mode. Even if the source executed many transactions concurrently, the replica applies them one at a time. This is why multi-threaded replication was introduced.
+                </p>
+
+                <h2>Multi-threaded Replication (MTS)</h2>
+
+                <p>
+                    With multi-threaded replication, a replica can handle multiple transactions at once, because of several worker threads. This really helps when the source is busy with lots of concurrent activity.
+                </p>
+
+                <p>
+                    Enable multi-threaded replication by setting <code>replica_parallel_workers</code> (or <code>slave_parallel_workers</code> in older versions):
+                </p>
+
+                <pre><code>SET GLOBAL replica_parallel_workers = 4;</code></pre>
+
+                <p>
+                    When MTS is enabled, the SQL thread becomes a coordinator that reads transactions from the relay log and assigns them to worker threads for execution. The coordinator ensures proper ordering while maximizing parallelism.
+                </p>
+
+                <p>
+                    MySQL 5.7 introduced logical clock parallelism. The logical clock approach recognizes that transactions committed together in the same group commit on the source are independent and can be applied in parallel. This is based on a key insight: if transactions could commit together on the source without conflicts, they can be applied in parallel on the replica.
+                </p>
+
+                <p>
+                    The source server adds logical timestamps to each transaction in the binary log. These timestamps indicate the "commit parent" of each transaction, essentially marking which transactions were in the same commit group. The replica coordinator uses these timestamps to schedule parallel execution.
+                </p>
+
+                <pre><code>-- Configure logical clock parallelism (default in MySQL 8.0)
+SET GLOBAL replica_parallel_type = 'LOGICAL_CLOCK';</code></pre>
+
+                <p>
+                    MySQL 8 introduced WRITESET-based parallelism, which analyzes the actual rows modified by each transaction. Transactions modifying non-overlapping rows can execute in parallel regardless of commit timing. This provides the highest level of parallelism but requires additional memory for tracking.
+                </p>
+
+                <pre><code>SET GLOBAL binlog_transaction_dependency_tracking = 'WRITESET';
+SET GLOBAL transaction_write_set_extraction = 'XXHASH64';</code></pre>
+
+                <h2>Semi-synchronous replication</h2>
+
+                <p>
+                    By default, MySQL replication is fully asynchronous. The source commits transactions without waiting for any replica to receive them. This provides the best performance but creates a window where committed transactions could be lost if the source crashes before replicas receive them.
+                </p>
+
+                <p>
+                    Semi-synchronous replication makes the source pause until at least one replica confirms it got the transaction. So, it gives you a better safety for your data, though it can slow things down a bit.
+                </p>
+
+                <p>The semi-synchronous flow works as follows:</p>
+                <ol>
+                    <li>Client sends <code>COMMIT</code> to source</li>
+                    <li>Source writes transaction to binary log</li>
+                    <li>Source waits for replica acknowledgment</li>
+                    <li>Replica receives transaction and writes to relay log</li>
+                    <li>Replica sends <code>ACK</code> back to source</li>
+                    <li>Source commits in storage engine and returns to client</li>
+                </ol>
+
+                <p>
+                    Semi-synchronous replication includes a timeout mechanism. If no replica acknowledges within the timeout (default 10 seconds), the source falls back to asynchronous replication to prevent blocking indefinitely:
+                </p>
+
+                <pre><code>SET GLOBAL rpl_semi_sync_source_timeout = 10000;  -- 10 seconds</code></pre>
+
+                <p>You can also require acknowledgment from multiple replicas:</p>
+
+                <pre><code>-- Wait for 2 replicas to acknowledge
+SET GLOBAL rpl_semi_sync_source_wait_for_replica_count = 2;</code></pre>
+
+                <h2>Replication filters</h2>
+
+                <p>
+                    MySQL supports filtering which databases, tables, or events are replicated. Filters can be applied on either the source or replica side.
+                </p>
+
+                <p>Source-side filtering controls what is written to the binary log:</p>
+
+                <pre><code>-- Only log changes to specific databases
+binlog_do_db = production
+binlog_do_db = analytics
+
+-- Ignore specific databases
+binlog_ignore_db = test
+binlog_ignore_db = staging</code></pre>
+
+                <p>Replica-side filtering controls what is applied from the relay log:</p>
+
+                <pre><code>-- Only apply changes to specific databases
+replicate_do_db = production
+
+-- Ignore specific tables
+replicate_ignore_table = production.audit_log
+
+-- Use wildcards for flexible matching
+replicate_wild_do_table = production.%
+replicate_wild_ignore_table = %.temp_%</code></pre>
+
+                <p>
+                    Note, if a statement references multiple databases and filtering is in effect, results may be unexpected. Row-based replication with replica-side filtering is generally safer than statement-based replication.
+                </p>
+
+                <h2>Monitoring Replication Lag</h2>
+
+                <p>
+                    Replication lag is the delay between when a transaction commits on the source and when it is applied on the replica. Some lag is inherent in asynchronous replication, but excessive lag can cause consistency issues for applications reading from replicas.
+                </p>
+
+                <p>
+                    The traditional method checks <code>Seconds_Behind_Master</code> in <code>SHOW REPLICA STATUS</code>:
+                </p>
+
+                <pre><code>mysql> SHOW REPLICA STATUS\G
+*************************** 1. row ***************************
+        Replica_IO_Running: Yes
+       Replica_SQL_Running: Yes
+         Seconds_Behind_Master: 15</code></pre>
+
+                <p>
+                    This metric compares timestamps between the relay log event currently being executed and the most recently received event.
+                </p>
+
+                <h2>Best Practices for Replication in Production</h2>
+
+                <p>Deploy replicas with equal or greater resources than the source. A replica with fewer CPU cores, less memory, or slower disks will inevitably lag.</p>
+
+                <p>Use row-based replication for safety and predictability. While statement-based logging is more compact, the risk of non-deterministic behavior outweighs the space savings.</p>
+
+                <p>Configure crash-safe replication with table-based metadata repositories. This prevents inconsistencies after replica crashes.</p>
+
+                <p>Use semi-synchronous replication when durability is critical. Accept the latency overhead to guarantee that committed transactions exist on at least one replica.</p>
+
+                <p>Monitor replication lag continuously and alert when it exceeds acceptable thresholds. Integrate lag monitoring into your application health checks.</p>
+
+                <p>Keep primary keys on all replicated tables. This is the single most impactful optimization for row-based replication performance.</p>
+
+                <p>Test failover procedures regularly. Replication is only valuable for high availability if you can actually promote a replica when needed.</p>
+
+                <h2>Replication Topology Patterns</h2>
+
+                <p>
+                    MySQL replication supports various topology patterns beyond simple source-to-replica setups.
+                </p>
+
+                <p>
+                    Chain replication connects replicas in sequence: A replicates to B, B replicates to C. This reduces load on the primary but increases lag for downstream replicas. Enable <code>log_replica_updates</code> on intermediate servers so they write received transactions to their own binary logs.
+                </p>
+
+                <pre><code># Enable on replica B so it can act as source for replica C
+[mysqld]
+log_replica_updates = ON
+log_bin = mysql-bin</code></pre>
+
+                <p>
+                    Multi-source replication allows a single replica to receive changes from multiple sources. Each source connection is managed through a replication channel:
+                </p>
+
+                <pre><code>CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'source1.example.com',
+  SOURCE_USER = 'repl',
+  SOURCE_PASSWORD = 'password'
+  FOR CHANNEL 'source1';
+
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'source2.example.com',
+  SOURCE_USER = 'repl',
+  SOURCE_PASSWORD = 'password'
+  FOR CHANNEL 'source2';</code></pre>
+
+                <p>
+                    This pattern is useful for aggregating data from multiple shards into a central reporting database. Each channel has independent I/O and SQL threads.
+                </p>
+
+                <h2>Binary Log Disk Management</h2>
+
+                <p>
+                    Binary logs can eat up a lot of disk space on busy servers. It's important to make sure you don't run out of room, while still keeping enough history for recovery or setting up new replicas.
+                </p>
+
+                <p>
+                    By the way, we can purge old binary logs based on time or space with the following options:
+                </p>
+
+                <pre><code>-- Remove logs older than 7 days
+SET GLOBAL binlog_expire_logs_seconds = 604800;
+
+-- Or use the older days-based option
+SET GLOBAL expire_logs_days = 7;</code></pre>
+
+                <p>Manual purging can target specific files:</p>
+
+                <pre><code>-- Remove all logs before this file
+PURGE BINARY LOGS TO 'mysql-bin.000050';
+
+-- Remove logs older than a specific date
+PURGE BINARY LOGS BEFORE '2024-01-15 00:00:00';</code></pre>
+
+                <p>We can also monitor binary log disk usage:</p>
+
+                <pre><code>SHOW BINARY LOGS;  -- Lists all binary logs with sizes
+SHOW MASTER STATUS;  -- Current binary log file and position</code></pre>
+
+                <h2>Footnote</h2>
+
+                <p>
+                    MySQL binlog replication has a pull-based architecture where replicas request events from sources, storing them in relay logs before applying.
+                </p>
+
+                <p>
+                    The replication supports statement and row-based logging, with GTIDs providing transaction tracking and multi-threaded appliers enabling parallel execution. Semi-synchronous replication offers stronger durability guarantees when needed.
+                </p>
+
+                <p>
+                    The binary log isn't only about replication, rather, it is also the 'backbone' for things like disaster recovery, real-time data capture, and broader database architecture.
+                </p>
+
+                <p>
+                    Replication workflow is different in different databases, and nuances are what make them special.
+                </p>
+
+                <div class="share-section">
+                    <p><em>If you find this helpful and interesting,</em></p>
+                    <ul>
+                        <li>share it on HackerNews</li>
+                        <li>subscribe to my RSS feed and get notified the moment I publish a new one.</li>
+                    </ul>
+                </div>
+            </div>
+        </article>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-content">
+            <div class="footer-section">
+                <h3>Sunil Patel</h3>
+                <p>Staff Engg at GCP Memorystore, Creator of DiceDB, ex-Staff Engg for Google Ads and GCP Dataproc, ex-Amazon Fast Data, ex-Director of Engg. SRE and Data Engineering at Unacademy. I spark engineering curiosity through my no-fluff engineering videos on YouTube and my courses</p>
+            </div>
+
+            <div class="footer-section">
+                <h4>Writings and Learnings</h4>
+                <ul>
+                    <li><a href="blogs.html">Blogs</a></li>
+                    <li><a href="papershelf.html">Papershelf</a></li>
+                    <li><a href="bookshelf.html">Bookshelf</a></li>
+                    <li><a href="#">RSS Feed</a></li>
+                </ul>
+            </div>
+
+            <div class="footer-section">
+                <h4>Courses</h4>
+                <ul>
+                    <li><a href="courses.html">System Design Masterclass</a></li>
+                    <li><a href="courses.html">System Design for Beginners</a></li>
+                    <li><a href="courses.html">Redis Internals</a></li>
+                </ul>
+            </div>
+
+            <div class="footer-section">
+                <h4>Legal and Contact</h4>
+                <ul>
+                    <li><a href="#">About me</a></li>
+                    <li><a href="#">Terms and Conditions</a></li>
+                    <li><a href="#">Privacy Policy</a></li>
+                    <li><a href="#">Refund Policy</a></li>
+                    <li><a href="#">Contact Me</a></li>
+                </ul>
+            </div>
+
+            <div class="footer-section">
+                <h4>Everything Else</h4>
+                <ul>
+                    <li><a href="#">Collaborate with me</a></li>
+                    <li><a href="#">DiceDB</a></li>
+                    <li><a href="#">Revine</a></li>
+                    <li><a href="#">The Smarter Chimp</a></li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="newsletter">
+            <h4>Arpit's Newsletter read by 145,000 engineers</h4>
+            <p>Weekly essays on real-world system design, distributed systems, or a deep dive into some super-clever algorithm.</p>
+            <div class="newsletter-buttons">
+                <a href="#" class="newsletter-btn">Subscribe on LinkedIn</a>
+                <a href="#" class="newsletter-btn">Subscribe on Substack</a>
+            </div>
+        </div>
+
+        <div class="footer-bottom">
+            <p>The courses listed on this website are offered by</p>
+            <p>Relog Deeptech Pvt. Ltd.<br>
+            203, Sagar Apartment, Camp Road, Mangilal Plot, Amravati, Maharashtra, 444602<br>
+            GSTIN: 27AALCR5165R1ZF</p>
+            <div class="social-links">
+                <a href="#" class="social-link">YouTube (180k)</a>
+                <a href="#" class="social-link">Twitter (100k)</a>
+                <a href="#" class="social-link">LinkedIn (250k)</a>
+                <a href="#" class="social-link">GitHub (6k)</a>
+            </div>
+            <p class="copyright">© Sunil Patel, 2025</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
